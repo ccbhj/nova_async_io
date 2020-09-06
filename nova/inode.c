@@ -1139,6 +1139,11 @@ struct inode *nova_new_vfs_inode(enum nova_new_inode_type type,
 	pi->create_epoch_id = epoch_id;
 	nova_init_inode(inode, pi);
 
+	struct nova_inode_info *ino_info,*ino_info2=NULL;
+	ino_info2 = NOVA_I(inode);
+	ino_info = container_of(inode, struct nova_inode_info, vfs_inode);
+	long x = (long)ino_info - (long)inode;
+
 	if (metadata_csum) {
 		alter_pi = (struct nova_inode *)nova_get_block(sb,
 								alter_pi_addr);
@@ -1150,6 +1155,7 @@ struct inode *nova_new_vfs_inode(enum nova_new_inode_type type,
 	si = NOVA_I(inode);
 	sih = &si->header;
 	nova_init_header(sb, sih, inode->i_mode);
+
 	sih->pi_addr = pi_addr;
 	sih->alter_pi_addr = alter_pi_addr;
 	sih->ino = ino;
