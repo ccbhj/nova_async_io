@@ -21,26 +21,256 @@
 #include <linux/mm.h>
 #include <linux/uio.h>
 
+#include "asm/page_types.h"
+#include "log.h"
 #include "nova.h"
 #include "stats.h"
 #include "inode.h"
+#include "direct_io.h"
 
-/*file.c*/
-extern ssize_t nova_wrap_rw_iter(struct kiocb *iocb, struct iov_iter *iter);
-
-
-ssize_t do_nova_cow_file_write_async(struct file *filp, struct page **kaddr,
-                                     size_t len, loff_t ppos)
+/*
+ * perform a COW write 
+ * hold the inode lock before calling !
+ */
+static ssize_t do_nova_cow_file_write_async(struct file *filp,
+    struct page **kaddr, size_t len, loff_t ppos)
 {
-    return -EIO;
+  struct address_space *mapping = filp->f_mapping;
+  struct inode *inode = mapping->host;
+  struct nova_inode_info *si = NOVA_I(inode);
+  struct nova_inode_info_header *sih = &si->header;
+  struct super_block *sb = inode->i_sb;
+  struct nova_inode *pi, inode_copy;
+  struct nova_file_write_entry entry_data;
+  struct nova_inode_update update;
+  ssize_t written = 0;
+  
+  loff_t pos;
+  unsigned long start_blk, num_blocks;
+  unsigned long total_blocks;
+  unsigned long blocknr = 0;
+  unsigned int data_bits;
+  int allocated = 0;
+  void *kmem;
+  u64 file_size;
+  size_t bytes;
+  long status = 0;
+  INIT_TIMING(cow_write_time);
+  INIT_TIMING(memcpy_time);
+  unsigned long step = 0;
+  ssize_t ret;
+  u64 begin_tail = 0;
+  int try_inplace = 0;
+  u64 epoch_id;
+  u32 time;
+  
+  size_t count, page_offset, offset, copied;
+  size_t all_copied = 0;
+  size_t remain_bytes = 0;
+  size_t to_copy = 0;
+  unsigned kpage_i = 0;
+
+  if (len == 0)
+    return 0;
+  
+  NOVA_START_TIMING(do_cow_write_async_t, cow_write_time);
+  
+  pos = ppos;
+  
+  if (filp->f_flags & O_APPEND) 
+    pos = i_size_read(inode);
+
+  count = len;
+
+  pi = nova_get_block(sb, sih->pi_addr);
+  if (nova_check_inode_integrity(sb, sih->ino, sih->pi_addr, 
+        sih->alter_pi_addr, &inode_copy, 0) < 0) {
+    ret = -EIO;
+    goto out;
+  } 
+
+  offset = pos & (sb->s_blocksize - 1);
+  num_blocks = ((count + offset - 1) >> sb->s_blocksize) + 1;
+  total_blocks = num_blocks;
+  start_blk = pos >> sb->s_blocksize_bits;
+
+  if (nova_check_overlap_vmas(sb, sih, start_blk, num_blocks)) {
+    nova_dbgv("COW write overlaps with vma: inode %lu, pgoff %lu, %lu blocks\n",
+        inode->i_ino, start_blk, num_blocks );
+    NOVA_STATS_ADD(cow_overlap_mmap, 1);
+    try_inplace = 1;
+    ret = -EACCES;
+    goto out;
+  }
+
+  ret = file_remove_privs(filp);
+  if (ret)
+    goto out;
+
+  inode->i_ctime = inode->i_mtime = current_time(inode);
+  time = current_time(inode).tv_sec;
+  
+  nova_dbgv("%s: inode %lu, offset %lld, count %lu\n",
+      __func__, inode->i_ino, pos, count);
+ 
+  
+  // 1. allocate as many blocks as this write work need to make a copy
+  // 2. append the file write entry
+  // 3. update the log tail and the radix
+  // 4. finally return the old version of the data to allocator
+  epoch_id = nova_get_epoch_id(sb);
+  update.tail = sih->log_tail;
+  update.alter_tail = sih->alter_log_tail;
+  while (num_blocks > 0) {
+    offset = pos & (nova_inode_blk_size(sih) - 1);
+    start_blk = pos >> sb->s_blocksize_bits;
+
+    allocated = nova_new_data_blocks(sb, sih, &blocknr, start_blk,
+        num_blocks, ALLOC_NO_INIT, ANY_CPU, ALLOC_FROM_HEAD);
+
+    nova_dbg_verbose("%s: alloc %d blocks @ %lu\n", 
+        __func__, allocated, blocknr);
+
+    if (allocated <= 0) {
+      nova_dbg("%s alloc blocks failed %d\n", __func__, allocated);
+      ret = allocated;
+      goto out;
+    }
+
+    step++;
+    bytes = sb->s_blocksize * allocated - offset;
+    if (bytes > count) 
+      bytes = count;
+
+    kmem = nova_get_block(inode->i_sb,
+        nova_get_block_off(sb, blocknr, sih->i_blk_type));
+
+    if (offset || ((offset + bytes) & (PAGE_SIZE - 1)) != 0) {
+      ret = nova_handle_head_tail_blocks(sb, inode, pos, bytes, kmem);
+      if (ret)
+        goto out;
+    }
+
+    // copy kpage to new blocks page by page
+    NOVA_START_TIMING(memcpy_w_nvmm_t, memcpy_time);
+    nova_memunlock_range(sb, kmem + offset, bytes);
+    remain_bytes = bytes;
+    page_offset = 0;
+    do {
+      to_copy = remain_bytes < PAGE_SIZE - page_offset ? remain_bytes : PAGE_SIZE - page_offset;
+
+      copied = to_copy -
+        memcpy_to_pmem_nocache(kmem + offset + all_copied, 
+            kaddr[kpage_i] + page_offset, to_copy);
+
+      page_offset = copied & (PAGE_SIZE - 1);
+      if (page_offset != 0 || copied == 0)
+        nova_warn("An error ocurr when memcpy kpage %d to offset %lu, \
+            to_copy: %lu, %lu copied", 
+            kpage_i, offset + all_copied, to_copy, copied);
+      else 
+        kpage_i++;
+
+      all_copied += copied;
+      remain_bytes -= copied;
+    } while (remain_bytes);
+
+    nova_memlock_range(sb, kmem + offset, bytes);
+    NOVA_END_TIMING(memcpy_w_nvmm_t, memcpy_time);
+
+    if (data_csum > 0 || data_parity > 0) {
+      ret = nova_protect_file_data_pages(sb, inode, pos, bytes, 
+          kaddr, blocknr, false);
+      if (ret)
+        goto out;
+    }
+    
+    if (pos + all_copied > inode->i_size) 
+      file_size = cpu_to_le64(pos + all_copied);
+    else
+      file_size = cpu_to_le64(inode->i_size);
+
+    nova_init_file_write_entry(sb, sih, &entry_data, epoch_id,
+        start_blk, allocated, blocknr, time, file_size);
+
+    ret = nova_append_file_write_entry(sb, pi, inode, &entry_data, &update);
+
+    if (ret) {
+      nova_dbg("%s: append inode entry failed\n", __func__);
+      ret = -ENOSPC;
+      goto out;
+    }
+    
+    nova_dbg("Write: %p, %lu\n", kmem, all_copied);
+
+    if (all_copied > 0) {
+      status = all_copied;
+      written += all_copied;
+      pos += all_copied;
+      count -= all_copied;
+      num_blocks -= allocated;
+    }
+
+    if (unlikely(all_copied != bytes)) {
+      nova_dbg("%s ERROR: %p, bytes %lu, all_copied %lu\n",
+          __func__, kmem, bytes, copied);
+      if (status >= 0)
+        status = -EFAULT;
+    }
+    if (status < 0)
+      break;
+
+    if (begin_tail == 0)
+      begin_tail = update.curr_entry;
+  } // while
+
+  data_bits = blk_type_to_shift[sih->i_blk_type];
+  sih->i_blocks += (total_blocks << (data_bits - sb->s_blocksize_bits));
+  
+  nova_memunlock_inode(sb, pi);
+	nova_update_inode(sb, inode, pi, &update, 1);
+  nova_memlock_inode(sb, pi);
+  
+  ret = nova_reassign_file_tree(sb, sih, begin_tail);
+  if (ret)
+    goto out;
+
+  inode->i_blocks = sih->i_blocks;
+
+  ret = written;
+  NOVA_STATS_ADD(cow_write_breaks, step);
+	nova_dbgv("blocks: %lu, %lu\n", inode->i_blocks, sih->i_blocks);
+  
+  // *ppos = pos;
+  if (pos > inode->i_size) {
+    i_size_write(inode, pos);
+    sih->i_size = pos;
+  }
+
+  sih->trans_id++;
+out:
+
+  if (ret < 0)
+    nova_cleanup_incomplete_write(sb, sih, blocknr, allocated,
+        begin_tail, update.tail);
+
+  NOVA_END_TIMING(do_cow_write_t, cow_write_time);
+  NOVA_STATS_ADD(cow_write_bytes, written);
+
+  if (try_inplace) 
+    return do_nova_inplace_file_write_async(filp, kaddr, len, ppos);
+
+  return ret;
 }
+
+
 /*
 @filp: point to file struct
 @kaddr: Virtual address corresponding to buffer
 @len: length to write
 @ppos : offset of this write
 */
-ssize_t do_nova_inplace_file_write_async(struct file *filp, struct page **kaddr,
+  ssize_t do_nova_inplace_file_write_async(struct file *filp, struct page **kaddr,
                                          size_t len, loff_t ppos)
 {
     
@@ -248,6 +478,7 @@ ssize_t do_nova_inplace_file_write_async(struct file *filp, struct page **kaddr,
             nova_inplace_update_write_entry(sb, inode, entry,
                                             &entry_info);
         }
+
         nova_dbg("Write:%p,%lu\n", kmem, all_copied);
         if (all_copied > 0)
         {
@@ -340,16 +571,18 @@ ssize_t nova_dax_file_write_async(struct file *filp, struct page **kaddr,
     if (len == 0)
         return 0;
     //NOVA_START_TIMING(write_t, time);
+    sb_start_write(inode->i_sb);
 
-    if (test_opt(inode->i_sb, DATA_COW))
+    if (test_opt(inode->i_sb, DATA_COW)) {
         ret = do_nova_cow_file_write_async(filp, kaddr, len, ppos);
+        inode_unlock(inode);
+    }
     else{
-        
         ret = do_nova_inplace_file_write_async(filp, kaddr, len, ppos);
         inode_unlock(inode);
-	    sb_end_write(inode->i_sb);
     }
         
+	    sb_end_write(inode->i_sb);
 
     //NOVA_END_TIMING(write_t, time);
     return ret;
@@ -428,8 +661,7 @@ ssize_t nova_dax_file_read_async(struct file *filp, struct page **kaddr,
             return -EIO;
 
         if (index < entryc->pgoff ||
-            index - entryc->pgoff >= entryc->num_pages)
-        {
+            index - entryc->pgoff >= entryc->num_pages) {
             nova_err(sb, "%s ERROR: %lu, entry pgoff %llu, num %u, blocknr %llu\n",
                      __func__, index, entry->pgoff,
                      entry->num_pages, entry->block >> PAGE_SHIFT);
@@ -542,7 +774,6 @@ int sb_init_wq(struct super_block *sb)
         destroy_workqueue(wq);
     return 0;
 }
-static void queue_wait_work(struct nova_inode_info *ino_info);
 
 void nova_async_work(struct work_struct *p_work)
 {
@@ -575,7 +806,7 @@ void nova_async_work(struct work_struct *p_work)
     pp->pages = (struct page **)kzalloc(n_page * sizeof(struct page *), GFP_KERNEL);
     pp->kaddr = (struct page **)kzalloc(n_page * sizeof(struct page *), GFP_KERNEL);
    
-    down_read(&a_work->tsk->mm->mmap_sem);
+    
     r = get_user_pages_remote(a_work->tsk, a_work->tsk->mm, addr, n_page, 1, pp->pages, NULL, NULL);
 
     nova_info("iv->iov_base : %p , len : %lu , addr : %p , n_page: %d , r :%d",iv->iov_base,len,addr,n_page,r);
@@ -653,7 +884,7 @@ out:
     struct super_block *sb = ino_info->vfs_inode.i_sb;
 
     first_blk = a_work->first_blk;
-	nr = a_work->blknr;
+    nr = a_work->blknr;
     //queue work from conflict queue
     if (!list_empty(&a_work->aio_conflicq))
     {
@@ -733,7 +964,7 @@ ssize_t nova_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
     
     struct file *filp = iocb->ki_filp;
     struct inode *inode = filp->f_mapping->host;
-    struct iovec *iv = iter->iov;
+    const struct iovec *iv = iter->iov;
     struct nova_inode_info *ino_info;
     struct super_block *sb = inode->i_sb;
     struct async_work_struct *io_work;

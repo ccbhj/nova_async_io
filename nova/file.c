@@ -787,7 +787,7 @@ static ssize_t do_nova_cow_file_write(struct file *filp,
 		NOVA_START_TIMING(memcpy_w_nvmm_t, memcpy_time);
 		nova_memunlock_range(sb, kmem + offset, bytes);
 		copied = bytes - memcpy_to_pmem_nocache(kmem + offset,
-												buf, bytes);
+												buf, bytes); 
 		nova_memlock_range(sb, kmem + offset, bytes);
 		NOVA_END_TIMING(memcpy_w_nvmm_t, memcpy_time);
 

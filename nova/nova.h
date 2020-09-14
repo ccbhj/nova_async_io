@@ -996,6 +996,9 @@ int nova_handle_head_tail_blocks(struct super_block *sb,
 int nova_protect_file_data(struct super_block *sb, struct inode *inode,
 	loff_t pos, size_t count, const char __user *buf, unsigned long blocknr,
 	bool inplace);
+int nova_protect_file_data_pages(struct super_block *sb, struct inode *inode,
+          loff_t pos, size_t count, struct page **kaddr,
+          unsigned long blocknr, bool inplace);
 ssize_t nova_inplace_file_write(struct file *filp, const char __user *buf,
 				size_t len, loff_t *ppos);
 ssize_t do_nova_inplace_file_write(struct file *filp, const char __user *buf,

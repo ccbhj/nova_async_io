@@ -437,6 +437,200 @@ out:
 	return ret;
 }
 
+
+int nova_protect_file_data_pages(struct super_block *sb, struct inode *inode,
+	loff_t pos, size_t count, struct page **kaddr,
+  unsigned long blocknr, bool inplace)
+{
+  struct nova_inode_info *si = NOVA_I(inode);
+  struct nova_inode_info_header *sih = &si->header;
+  size_t offset, eblk_offset, bytes;
+  unsigned long start_blk, end_blk, num_blocks, nvmm, nvmmoff;
+  unsigned long blocksize = sb->s_blocksize;
+  unsigned int blocksize_bits = sb->s_blocksize_bits;
+  u8 *blockbuf, *blockptr;
+  struct nova_file_write_entry *entry;
+  struct nova_file_write_entry *entryc, entry_copy;
+  bool mapped, nvmm_ok;
+  int ret = 0;
+
+  size_t remain_len;
+  size_t to_copy, kpage_i;
+  void *copied;
+
+  INIT_TIMING(protect_file_data_time);
+  INIT_TIMING(memcpy_time);
+
+  NOVA_START_TIMING(protect_file_data_t, protect_file_data_time);
+
+  offset = pos & (blocksize - 1);
+  num_blocks = ((offset + count - 1) >> blocksize_bits) + 1;
+  start_blk = pos >> blocksize_bits;
+  end_blk = start_blk + num_blocks - 1;
+  
+  NOVA_START_TIMING(protect_memcpy_t, memcpy_time);
+  blockbuf = kmalloc(blocksize, GFP_KERNEL);
+  if (!blockbuf) {
+    nova_err(sb, "%s: block bufer allocation error\n", __func__);
+    return -ENOMEM;
+  }
+
+  bytes = blocksize - offset;
+  if (bytes > count) 
+    bytes = count;
+
+  // copy mapped pages from user to blockbuf page by page
+  remain_len = bytes;
+  kpage_i = 0;
+  copied = NULL;
+  do {
+    to_copy = remain_len < PAGE_SIZE ? remain_len : PAGE_SIZE;
+    copied = memcpy(blockbuf + offset + kpage_i * PAGE_SIZE, 
+        kaddr[kpage_i] , to_copy);
+
+    if (unlikely(!copied)) {
+      NOVA_END_TIMING(protect_memcpy_t, memcpy_time);
+      nova_err(sb, "%s: not all data is copied from user! expect to copy %zu bytes, actually copied %zu bytes\n",
+           __func__, bytes, bytes - remain_len);
+      ret = -EFAULT;
+      goto out;
+    }
+
+    remain_len -= to_copy;
+    kpage_i++;
+  } while (remain_len);
+
+	NOVA_END_TIMING(protect_memcpy_t, memcpy_time);
+  
+  entryc = (metadata_csum == 0) ? entry : &entry_copy;
+
+  /*
+   * if offset is not zero, find the entry and copy the whole start block to blockbuf
+   * if entry doesn't exist, set the start block to zero from start to offset.
+   */
+  if (offset != 0) {
+    NOVA_STATS_ADD(protect_head, 1);
+    entry = nova_get_write_entry(sb, sih, start_blk);
+    if (entry) {
+      if (!metadata_csum)
+        entryc = entry;
+      else if (!nova_verify_entry_csum(sb, entry, entryc))
+        return -EIO;
+
+      nvmm = get_nvmm(sb, sih, entryc, start_blk); // get data
+      nvmmoff = nova_get_block_off(sb, nvmm, sih->i_blk_type); 
+      blockptr = (u8 *) nova_get_block(sb, nvmmoff); // get pmem address
+
+      mapped = nova_find_pgoff_in_vma(inode, start_blk);
+      // data not in dram and not written inplace
+      // check the csum
+      if (data_csum > 0 && !mapped && !inplace) {
+        nvmm_ok = nova_verify_data_csum(sb, sih, nvmm, 0, offset);
+        if (!nvmm_ok) {
+          ret = -EIO;
+          goto out;
+        }
+      }
+
+      ret = memcpy_mcsafe(blockbuf, blockptr, offset);
+      if (ret < 0)
+        goto out;
+    } else {
+      memset(blockbuf, 0, offset);
+    } // if (entry)
+
+  } // if (offset)
+
+  if (num_blocks == 1)
+    goto eblk;
+  
+  // update the start block's checksum
+  kpage_i = 0;
+  remain_len = 0;
+  copied = NULL;
+  do {
+    if (inplace)
+      nova_update_block_csum_parity(sb, sih, blockbuf, blocknr, offset, bytes);
+    else 
+      nova_update_block_csum_parity(sb, sih, blockbuf, blocknr, 0, blocksize);
+
+    blocknr++;
+    pos += bytes;
+    // buf += bytes;
+    count -= bytes;
+    offset = pos & (blocksize - 1);
+    bytes = count < blocksize ? count : blocksize;
+
+    remain_len = bytes;
+    // copy to blockbuf page by page
+    do {
+      to_copy = remain_len < PAGE_SIZE ? remain_len : PAGE_SIZE;
+      copied = memcpy(blockbuf + kpage_i * PAGE_SIZE,
+          kaddr[kpage_i], to_copy);
+      if (unlikely(!copied)) {
+        nova_err(sb, "%s: not all data is copied from user!  expect to copy %zu bytes, actually copied %zu bytes\n",
+           __func__, bytes, kpage_i * PAGE_SIZE - to_copy);
+        ret = -EFAULT;
+        goto out;
+      }
+      remain_len -= to_copy;
+      kpage_i++;
+    } while (remain_len);
+
+  } while (count > blocksize);
+
+eblk:
+  eblk_offset = (pos + count) & (blocksize - 1);
+
+  if (eblk_offset) {
+    NOVA_STATS_ADD(protect_tail, 1);
+    entry = nova_get_write_entry(sb, sih, end_blk);
+
+    if (entry) {
+      if (metadata_csum)
+        entryc = entry;
+      else if (!nova_verify_entry_csum(sb, entry, entryc))
+        return -EIO;
+
+      nvmm = get_nvmm(sb, sih, entryc, end_blk);
+      nvmmoff = nova_get_block_off(sb, nvmm, sih->i_blk_type);
+      blockptr = (u8 *) nova_get_block(sb, nvmmoff);
+
+      mapped = nova_find_pgoff_in_vma(inode, end_blk);
+      if (data_csum > 0 && !mapped && !inplace) {
+        nvmm_ok = nova_verify_data_csum(sb, sih, nvmm,
+            eblk_offset, blocksize - eblk_offset);
+        if (!nvmm_ok) {
+          ret = -EIO;
+          goto out;
+        }
+      }
+
+      ret = memcpy_mcsafe(blockbuf + eblk_offset, 
+          blockptr + eblk_offset,
+          blocksize - eblk_offset);
+      if (ret < 0)
+        goto out;
+    } else {
+      memset (blockbuf + eblk_offset, 0, 
+          blocksize- eblk_offset);
+    }
+  }
+
+  if (inplace) 
+    nova_update_block_csum_parity(sb, sih, blockbuf, blocknr,
+        offset, bytes);
+  else
+    nova_update_block_csum_parity(sb, sih, blockbuf, blocknr,
+        0, blocksize);
+out:
+  if (blockbuf != NULL)
+    kfree(blockbuf);
+
+  NOVA_END_TIMING(protect_file_data_t, protect_file_data_time);
+  return 0;
+}
+
 static bool nova_get_verify_entry(struct super_block *sb,
 	struct nova_file_write_entry *entry,
 	struct nova_file_write_entry *entryc,
